@@ -183,7 +183,14 @@ func SkipIfSingleNode(t *testing.T, minNodes int) {
 // Unlike WaitForClusterReady in opensearchapi/testutil, this uses raw HTTP requests and does not
 // require an opensearchapi.Client. This is useful for tests that need to wait for cluster
 // availability before creating a transport.
-func WaitForCluster(t *testing.T) {
+//
+// When the optional minNodes argument is provided and greater than 1, WaitForCluster additionally
+// polls /_nodes/http until the cluster reports at least that many nodes joined. If the cluster
+// stays permanently smaller (e.g., a single-node CI cluster), the test is skipped rather than
+// failed — matching the existing skip-rather-than-fail philosophy of SkipIfSingleNode. Tests that
+// need a multi-node cluster can use this single call instead of pairing WaitForCluster with
+// SkipIfSingleNode and racing the cluster's discovery startup.
+func WaitForCluster(t *testing.T, minNodes ...int) {
 	t.Helper()
 
 	const (
@@ -238,6 +245,9 @@ func WaitForCluster(t *testing.T) {
 			if attempt > 0 {
 				t.Logf("WaitForCluster: cluster ready after %d attempts", attempt+1)
 			}
+			if required := minNodeCount(minNodes); required > 1 {
+				waitForMinNodes(t, required)
+			}
 			return
 		}
 
@@ -253,6 +263,82 @@ func WaitForCluster(t *testing.T) {
 	}
 
 	t.Fatalf("WaitForCluster: cluster not ready after %d attempts (url=%s)", maxAttempts, healthURL.String())
+}
+
+// minNodeCount returns the first value of the variadic argument, or 0 if not set.
+func minNodeCount(minNodes []int) int {
+	if len(minNodes) == 0 {
+		return 0
+	}
+	return minNodes[0]
+}
+
+// waitForMinNodes polls /_nodes/http until the cluster reports at least minNodes nodes
+// joined, then returns. If the cluster stays permanently smaller, the test is skipped
+// (rather than failed) so single-node CI configurations do not break multi-node test
+// suites. Called from WaitForCluster after reachability has been confirmed.
+func waitForMinNodes(t *testing.T, minNodes int) {
+	t.Helper()
+
+	const (
+		maxAttempts          = 25
+		delayBetweenAttempts = 2 * time.Second
+		requestTimeout       = 2 * time.Second
+	)
+
+	u := GetTestURL(t)
+	nodesURL := *u
+	nodesURL.Path = "/_nodes/http"
+
+	client := &http.Client{Transport: GetTestTransport(t)}
+
+	var lastTotal int
+	for attempt := range maxAttempts {
+		ctx, cancel := context.WithTimeout(t.Context(), requestTimeout)
+
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, nodesURL.String(), nil)
+		if err != nil {
+			cancel()
+			t.Fatalf("WaitForCluster: failed to create /_nodes/http request: %v", err)
+		}
+		if IsSecure(t) {
+			req.SetBasicAuth("admin", GetPassword(t))
+		}
+
+		resp, err := client.Do(req)
+		cancel()
+		if err != nil {
+			t.Logf("WaitForCluster: minNodes attempt %d/%d: %v", attempt+1, maxAttempts, err)
+			time.Sleep(delayBetweenAttempts)
+			continue
+		}
+
+		var result struct {
+			Nodes struct {
+				Total int `json:"total"`
+			} `json:"_nodes"`
+		}
+		decodeErr := json.NewDecoder(resp.Body).Decode(&result)
+		resp.Body.Close()
+		if decodeErr != nil {
+			t.Fatalf("WaitForCluster: failed to decode /_nodes/http response: %v", decodeErr)
+		}
+
+		lastTotal = result.Nodes.Total
+		if lastTotal >= minNodes {
+			if attempt > 0 {
+				t.Logf("WaitForCluster: %d node(s) joined after %d minNodes attempts", lastTotal, attempt+1)
+			}
+			return
+		}
+
+		t.Logf("WaitForCluster: minNodes attempt %d/%d: %d node(s), need at least %d",
+			attempt+1, maxAttempts, lastTotal, minNodes)
+		time.Sleep(delayBetweenAttempts)
+	}
+
+	t.Skipf("Skipping %s: cluster has %d node(s) after %d attempts, need at least %d",
+		t.Name(), lastTotal, maxAttempts, minNodes)
 }
 
 // ignoredFieldPatterns contains field patterns that should be ignored during JSON comparison
